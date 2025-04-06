@@ -1,1 +1,7 @@
 .venv
+data
+logs
+tensorboard_logs
+__pycache__
+wandb
+nohup.out

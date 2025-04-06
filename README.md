@@ -14,11 +14,17 @@ https://zitonglan.github.io/project/avr/avr.html
 
 ## Installation
 
-Instructions on how to install and set up the project.
+Versions:
+- Python : 3.10
+- CUDA : 11.8
+
+Installation:
 
 ```bash
 git clone https://github.com/LIM-june/ARGS.git
 cd ARGS
+python -m venv .venv
+. .venv/bin/activate
 bash setup.sh
 ```
 
@@ -27,8 +33,7 @@ bash setup.sh
 Examples of how to use the project.
 
 ```bash
-# Example command
-python main.py
+bash train.sh
 ```
 
 ## Contributing
