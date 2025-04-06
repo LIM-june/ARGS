@@ -2,7 +2,7 @@
 
 ### Path settings
 path:
-  expname: Meshrir
+  expname: AVR
   dataset_type: MeshRIR
   logdir: logs/MeshRIR/
 
@@ -29,8 +29,8 @@ train:
   eta_min: 5e-5
   total_iterations: 500000
   load_ckpt: False
-  save_freq: 20000
-  val_freq: 20000
+  save_freq: 10000
+  val_freq: 10000
 
   spec_loss_weight: 2
   amplitude_loss_weight: 4

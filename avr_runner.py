@@ -14,6 +14,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from datasets_loader import WaveLoader
+import wandb
 
 from model import AVRModel, AVRModel_complex
 from renderer import AVRRender
@@ -23,7 +24,7 @@ from utils.criterion import Criterion
 
 
 class AVR_Runner():
-    def __init__(self, mode, dataset_dir, batchsize, **kwargs) -> None:
+    def __init__(self, mode, dataset_dir, batchsize, log, **kwargs) -> None:
         # Seperate each settings
         kwargs_path = kwargs['path']
         kwargs_render = kwargs['render']
@@ -38,19 +39,33 @@ class AVR_Runner():
         self.devices = torch.device('cuda')
 
         # Logger
+        self.log = True if log.lower() == 'on' else False
         log_filename = "logger.log"
-        log_savepath = os.path.join(self.logdir, self.expname, log_filename)
+        log_savepath = os.path.join(
+            self.logdir, self.expname, log_filename)
         self.logger = logger_config(
-            log_savepath=log_savepath, logging_name='avr')
+            log_savepath=log_savepath, logging_name=self.expname)
         self.logger.info("expname:%s, data type:%s, logdir:%s",
                          self.expname, self.dataset_type, self.logdir)
 
         # tensorboard writer
-        if mode == 'train':
-            log_prefix = f'tensorboard_logs/{(self.logdir).split("/")[1]}/{self.expname}'
-            os.makedirs(log_prefix, exist_ok=True)
-            self.writer = SummaryWriter(
-                log_dir=f'{log_prefix}/{datetime.now().strftime("%m%d-%H%M%S")}')
+        if self.log:
+            if mode == 'train':
+                log_prefix = f'tensorboard_logs/{(self.logdir).split("/")[1]}/{self.expname}'
+                time = datetime.now().strftime("%m%d-%H%M%S")
+                os.makedirs(log_prefix, exist_ok=True)
+                self.writer = SummaryWriter(log_dir=f'{log_prefix}/{time}')
+
+        # wandb logger
+                self.wandb = wandb.init(
+                    name=f'{self.expname}/{time}',
+                    # Set the wandb entity where your project will be logged (generally your team name).
+                    entity="LIM-june",
+                    # Set the wandb project where this run will be logged.
+                    project=f"ARGS_{self.logdir.split('/')[1]}",
+                    # Track hyperparameters and run metadata.
+                    config=kwargs,
+                )
 
         # network and renderer
         self.fs = kwargs['render']['fs']
@@ -196,15 +211,14 @@ class AVR_Runner():
                     pred_sig = pred_sig[..., 0] + 1j * pred_sig[..., 1]
                     ori_sig = (ori_sig.cuda()).to(pred_sig.dtype)
 
-                    spec_loss, amplitude_loss, angle_loss, time_loss, energy_loss, multi_stft_loss, _, _ = self.criterion(
-                        pred_sig, ori_sig)
+                    losses, *_ = self.calculate_metrics(
+                        pred_sig, ori_sig, self.fs, False)
 
-                    if torch.isnan(energy_loss).item():
+                    if torch.isnan(losses['energy']).item():
                         print("Nan loss detected")
                         continue
 
-                    total_loss = spec_loss + amplitude_loss + angle_loss + \
-                        time_loss + energy_loss + multi_stft_loss
+                    total_loss = losses['total']
 
                     self.optimizer.zero_grad()
                     total_loss.backward()
@@ -221,20 +235,24 @@ class AVR_Runner():
                     self.cosine_scheduler.step()
                     self.current_iteration += 1
 
-                    if self.current_iteration % 20 == 0:
+                    if self.log and self.current_iteration % 20 == 0:
                         self.writer.add_scalar(
                             f'train_loss', total_loss.detach(), self.current_iteration)
+                        self.wandb.log(
+                            {"train_loss": total_loss.detach()}, step=self.current_iteration)
 
                         for param_group in self.optimizer.param_groups:
                             current_lr = param_group['lr']
                             self.writer.add_scalar(
                                 f'learning rate', current_lr, self.current_iteration)
+                            self.wandb.log(
+                                {"learning rate": current_lr}, step=self.current_iteration)
 
                     pbar.update(1)
                     pbar.set_description(
                         f"{self.expname} Iteration {self.current_iteration}/{self.total_iterations}")
-                    pbar.set_postfix_str('loss = {:.4f}, multi stft loss:{:.4f}, spec loss:{:.3f}, amp loss:{:.3f}, angle loss:{:.3f}, time loss:{:.3f}, energy loss:{:.3f}, lr = {:.6f}'.format(
-                        total_loss.item(), multi_stft_loss, spec_loss, amplitude_loss, angle_loss, time_loss, energy_loss, self.optimizer.param_groups[0]['lr']))
+                    pbar.set_postfix_str(''.join([f'{key} = {val:.3f}, ' for key, val in losses.items(
+                    )]) + f'lr = {self.optimizer.param_groups[0]["lr"]:.6f}')
 
                     if self.current_iteration % self.save_freq == 0:
                         ckptname = self.save_checkpoint()
@@ -288,8 +306,9 @@ class AVR_Runner():
                         avg_metrics = {
                             key: val / num_batches for key, val in avg_metrics.items()}
 
-                        self.log_tensorboard(
-                            losses=avg_losses, metrics=avg_metrics, cur_iter=self.current_iteration, mode_set="test")
+                        if self.log:
+                            self.log_all(
+                                losses=avg_losses, metrics=avg_metrics, cur_iter=self.current_iteration, mode_set="test")
                         self.logger.info(
                             "Evaluations. Current Iteration:%d", self.current_iteration)
 
@@ -337,8 +356,9 @@ class AVR_Runner():
                                 avg_metrics = {
                                     key: val / num_batches for key, val in avg_metrics.items()}
 
-                                self.log_tensorboard(
-                                    losses=avg_losses, metrics=avg_metrics, cur_iter=self.current_iteration, mode_set="train")
+                                if self.log:
+                                    self.log_all(
+                                        losses=avg_losses, metrics=avg_metrics, cur_iter=self.current_iteration, mode_set="train")
 
                                 self.logger.info("Evaluations on training set")
                                 self.logger.info('Angle:{:.3f}, Amplitude:{:.4f}, Envelope:{:.4f}, T60:{:.5f}, C50:{:.5f}, EDT:{:.5f}, multi_stft:{:.4f}'.format(
@@ -348,57 +368,70 @@ class AVR_Runner():
 
                         self.renderer.train()
 
-    def calculate_metrics(self, pred_sig, ori_sig, fs):
+    def calculate_metrics(self, pred_sig, ori_sig, fs, return_metrics=False):
         """ calculate the metrics and losses
         """
         # Loss calculation
         spec_loss, amplitude_loss, angle_loss, time_loss, energy_loss, multi_stft_loss, ori_time, pred_time = self.criterion(
             pred_sig, ori_sig)
 
-        # Metrics calculation
-        angle_error, amp_error, env_error, t60_error, edt_error, C50_error, multi_stft, _, _ = metric_cal(
-            ori_time.detach().cpu().numpy(),
-            pred_time.detach().cpu().numpy(),
-            fs=fs
-        )
+        total_loss = spec_loss + amplitude_loss + angle_loss + \
+            time_loss + energy_loss + multi_stft_loss
 
         losses = {
-            'spec_loss': spec_loss,
-            'fft_loss': amplitude_loss + angle_loss,
-            'time_loss': time_loss,
-            'energy_loss': energy_loss,
-            'multi_stft_loss': multi_stft_loss
+            'total': total_loss,
+            'spec': spec_loss,
+            'fft': amplitude_loss + angle_loss,
+            'time': time_loss,
+            'energy': energy_loss,
+            'multi_stft': multi_stft_loss
         }
 
-        metrics = {
-            'Angle': angle_error,
-            'Amplitude': amp_error,
-            'Envelope': env_error,
-            'T60': t60_error,
-            'C50': C50_error,
-            'EDT': edt_error,
-            'multi_stft': multi_stft
-        }
+        # Metrics calculation
+        if return_metrics:
+            angle_error, amp_error, env_error, t60_error, edt_error, C50_error, multi_stft, _, _ = metric_cal(
+                ori_time.detach().cpu().numpy(),
+                pred_time.detach().cpu().numpy(),
+                fs=fs
+            )
 
-        return losses, metrics, ori_time, pred_time
+            metrics = {
+                'Angle': angle_error,
+                'Amplitude': amp_error,
+                'Envelope': env_error,
+                'T60': t60_error,
+                'C50': C50_error,
+                'EDT': edt_error,
+                'multi_stft': multi_stft
+            }
 
-    def log_tensorboard(self, losses=None, metrics=None, cur_iter=None, mode_set="train"):
+            return losses, metrics, ori_time, pred_time
+
+        else:
+            return losses, ori_time, pred_time
+
+    def log_all(self, losses=None, metrics=None, cur_iter=None, mode_set="train"):
         for loss_name, value in losses.items():
             self.writer.add_scalar(
                 f'{mode_set}_loss/{loss_name}', value, cur_iter)
+            self.wandb.log(
+                {f'{mode_set}_loss/{loss_name}': value}, step=cur_iter)
 
         for metric_name, value in metrics.items():
             self.writer.add_scalar(
                 f'{mode_set}_metric/{metric_name}', value, cur_iter)
+            self.wandb.log(
+                {f'{mode_set}_metric/{metric_name}': value}, step=cur_iter)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    parser.add_argument('--log', type=str, default='on')
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--config', type=str,
                         default='avr.yml', help='config file path')
     parser.add_argument('--dataset_dir', type=str, default='S1-M3969_npy')
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--batch_size', type=int, default=6)
     args = parser.parse_args()
 
     if args.mode == 'train':  # specify the config yaml
@@ -436,5 +469,5 @@ if __name__ == '__main__':
         print("Source and destination are the same, skipping copy.")
 
     worker = AVR_Runner(mode=args.mode, dataset_dir=args.dataset_dir,
-                        batchsize=args.batch_size, **kwargs)
+                        batchsize=args.batch_size, log=args.log, **kwargs)
     worker.train()
