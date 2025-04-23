@@ -5,6 +5,9 @@ Currently working on ARGS.
 Based on Acoustic Volume Rendering (AVR) for Neural Impulse Response Fields
 https://zitonglan.github.io/project/avr/avr.html
 
+Visualizations based on MeshRIR codes
+https://github.com/sh01k/MeshRIR
+
 ## Table of Contents
 
 - [Installation](#installation)
@@ -34,6 +37,7 @@ Examples of how to use the project.
 
 ```bash
 bash train.sh
+bash infer.sh
 ```
 
 ## Contributing

@@ -216,3 +216,15 @@ def quaternion_to_direction_vector(q):
     norm = math.sqrt(fwd_x**2 + 0**2 + fwd_z**2)
 
     return np.array([-fwd_x / norm, -fwd_z / norm, 0])
+
+
+class DummyDataset(Dataset):
+    def __init__(self, *args):
+        super().__init__()
+        self.data = self.batchify(args)
+
+    def __getitem__(self, index):
+        return None, *[batch[index] for batch in self.data]
+
+    def batchify(self, *args):
+        return [torch.stack(arg) for arg in args]

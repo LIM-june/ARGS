@@ -11,9 +11,9 @@ import sys
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
-from datasets_loader import WaveLoader
+from datasets_loader import WaveLoader, DummyDataset
 import wandb
 
 from model import AVRModel, AVRModel_complex
@@ -304,114 +304,125 @@ class AVR_Runner():
                         pbar.write('Saved checkpoints at {}'.format(ckptname))
 
                     if self.current_iteration % self.val_freq == 0:
+
                         self.logger.info("Start evaluation")
-                        self.renderer.eval()
 
-                        avg_losses = defaultdict(float)
-                        avg_metrics = defaultdict(float)
-
-                        for check_idx, test_batch in enumerate(self.test_iter):
-                            with torch.no_grad():
-                                if self.dataset == "RAF":
-                                    ori_sig, position_rx, position_tx, direction_tx = test_batch
-                                    pred_sig = self.renderer(
-                                        position_rx.cuda(), position_tx.cuda(), direction_tx.cuda())
-                                else:
-                                    ori_sig, position_rx, position_tx = test_batch
-                                    pred_sig = self.renderer(
-                                        position_rx.cuda(), position_tx.cuda())
-
-                                pred_sig = pred_sig[..., 0] + \
-                                    1j * pred_sig[..., 1]
-                                ori_sig = (ori_sig.cuda()).to(pred_sig.dtype)
-
-                                losses, metrics, ori_time, pred_time = self.calculate_metrics(
-                                    pred_sig, ori_sig, self.fs, True)
-
-                            for key in losses:
-                                avg_losses[key] += losses[key].detach()
-
-                            for key in metrics:
-                                avg_metrics[key] += metrics[key]
-
-                            if check_idx < self.kwargs_train['n_imgs']:
-                                save_dir = os.path.join(
-                                    self.savedir, f'img_test/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
-                                plot_and_save_figure(pred_sig[0, :], ori_sig[0, :], pred_time[0, :], ori_time[0, :],
-                                                     position_rx[0, :], position_tx[0, :], mode_set='test', save_path=save_dir)
-
-                                save_dir = os.path.join(
-                                    self.savedir, f'img_test_energy/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
-                                log_inference_figure(ori_time.detach().cpu().numpy()[0, :], pred_time.detach(
-                                ).cpu().numpy()[0, :], metrics=metrics, save_dir=save_dir)
-
-                        num_batches = len(self.test_iter)
-                        avg_losses = {
-                            key: val / num_batches for key, val in avg_losses.items()}
-                        avg_metrics = {
-                            key: val / num_batches for key, val in avg_metrics.items()}
-
-                        if self.log:
-                            self.log_all(
-                                losses=avg_losses, metrics=avg_metrics, cur_iter=self.current_iteration, mode_set="test")
                         self.logger.info(
                             "Evaluations. Current Iteration:%d", self.current_iteration)
+                        self.infer(
+                            dataset=self.test_set, viz='signal', name='test')
 
-                        self.logger.info('Angle:{:.3f}, Amplitude:{:.4f}, Envelope:{:.4f}, T60:{:.5f}, C50:{:.5f}, EDT:{:.5f}, multi_stft:{:.4f}'.format(
-                            avg_metrics['Angle'], avg_metrics['Amplitude'], avg_metrics['Envelope'], avg_metrics['T60'], avg_metrics['C50'], avg_metrics['EDT'], avg_metrics['multi_stft']))
-
-                        avg_losses = defaultdict(float)
-                        avg_metrics = defaultdict(float)
-
-                        for check_idx, train_iter_batch in enumerate(self.train_iter_show):
-                            with torch.no_grad():
-                                if self.dataset == "RAF":
-                                    ori_sig, position_rx, position_tx, direction_tx = train_iter_batch
-                                    pred_sig = self.renderer(
-                                        position_rx.cuda(), position_tx.cuda(), direction_tx.cuda())
-                                else:
-                                    ori_sig, position_rx, position_tx = train_iter_batch
-                                    pred_sig = self.renderer(
-                                        position_rx.cuda(), position_tx.cuda())
-
-                                pred_sig = pred_sig[..., 0] + \
-                                    1j * pred_sig[..., 1]
-                                ori_sig = (ori_sig.cuda()).to(pred_sig.dtype)
-
-                                losses, metrics, ori_time, pred_time = self.calculate_metrics(
-                                    pred_sig, ori_sig, self.fs, True)
-
-                            for key in losses:
-                                avg_losses[key] += losses[key].detach()
-
-                            for key in metrics:
-                                avg_metrics[key] += metrics[key]
-
-                            if check_idx < self.kwargs_train['n_imgs']:
-                                save_dir = os.path.join(
-                                    self.savedir, f'img_train/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
-                                plot_and_save_figure(pred_sig[0, :], ori_sig[0, :], pred_time[0, :], ori_time[0, :],
-                                                     position_rx[0, :], position_tx[0, :], mode_set='train', save_path=save_dir)
-
-                            if check_idx > 3000 or check_idx == len(self.train_iter_show) - 1:
-
-                                num_batches = check_idx + 1
-                                avg_losses = {
-                                    key: val / num_batches for key, val in avg_losses.items()}
-                                avg_metrics = {
-                                    key: val / num_batches for key, val in avg_metrics.items()}
-
-                                if self.log:
-                                    self.log_all(
-                                        losses=avg_losses, metrics=avg_metrics, cur_iter=self.current_iteration, mode_set="train")
-
-                                self.logger.info("Evaluations on training set")
-                                self.logger.info('Angle:{:.3f}, Amplitude:{:.4f}, Envelope:{:.4f}, T60:{:.5f}, C50:{:.5f}, EDT:{:.5f}, multi_stft:{:.4f}'.format(
-                                    avg_metrics['Angle'], avg_metrics['Amplitude'], avg_metrics['Envelope'], avg_metrics['T60'], avg_metrics['C50'], avg_metrics['EDT'], avg_metrics['multi_stft']))
-
-                                break
+                        self.logger.info("Evaluations on training set")
+                        self.infer(
+                            dataset=self.train_set_show, viz='signal', name='test')
 
                         self.renderer.train()
+
+    def infer(self, dataset=None, idxs=None, position_rxs=None, position_txs=None, direction_txs=None, viz=None, name='infer'):
+        """Save the inference results
+        Args:
+            idxs (list, optional): list of indices to sample. Defaults to None.
+            position_rxs (list, optional): list of receiver positions. Defaults to None.
+            position_txs (list, optional): list of transmitter positions. Defaults to None.
+            direction_txs (list, optional): list of transmitter directions. Defaults to None.
+            viz (str, optional): Set mode to 'signal' or 'map'. Defaults to None.
+                'signal': one-to-one signal comparison plots
+                'map': wave field comparison plots.
+                None : skip plots.
+            name (str, optional): name of the output directory and the plot. Defaults to 'infer'.
+            """
+        self.logger.info("Start inference")
+
+        # Create batch
+        if dataset is not None:
+            dataloader = DataLoader(
+                dataset, batch_size=self.batch_size, shuffle=False, num_workers=4)
+        elif idxs is not None:
+            if isinstance(idxs, int):
+                idxs = [idxs]
+            dataloader = DataLoader(
+                Subset(self.test_set, idxs), batch_size=self.batch_size, shuffle=False, num_workers=4)
+        elif position_rxs is not None and position_txs is not None and self.dataset != "RAF":
+            dataloader = DataLoader(
+                DummyDataset(position_rxs, position_txs), batch_size=self.batch_size, shuffle=False, num_workers=4)
+        elif position_rxs is not None and position_txs is not None and direction_txs is not None and self.dataset == "RAF":
+            dataloader = DataLoader(
+                DummyDataset(position_rxs, position_txs, direction_txs), batch_size=self.batch_size, shuffle=False, num_workers=4)
+        else:
+            dataloader = self.test_iter
+
+        # Inference
+        self.renderer.eval()
+
+        avg_losses = defaultdict(float)
+        avg_metrics = defaultdict(float)
+
+        for idx, test_batch in enumerate(dataloader):
+            with torch.no_grad():
+                if self.dataset == "RAF":
+                    ori_sig, position_rx, position_tx, direction_tx = test_batch
+                    pred_sig = self.renderer(
+                        position_rx.cuda(), position_tx.cuda(), direction_tx.cuda())
+                else:
+                    ori_sig, position_rx, position_tx = test_batch
+                    pred_sig = self.renderer(
+                        position_rx.cuda(), position_tx.cuda())
+
+                pred_sig = pred_sig[..., 0] + 1j * pred_sig[..., 1]
+
+                # Calculate metrics
+                if ori_sig[0] is not None:
+                    ori_sig = (ori_sig.cuda()).to(pred_sig.dtype)
+                    losses, metrics, ori_time, pred_time = self.calculate_metrics(
+                        pred_sig, ori_sig, self.fs, True)
+
+                    for key in losses:
+                        avg_losses[key] += losses[key].detach()
+
+                    for key in metrics:
+                        avg_metrics[key] += metrics[key]
+
+            # Visualization
+            if idx < self.kwargs_train['n_imgs']:
+                # Visualize both prediction and ground truth
+                if ori_sig[0] is not None:
+                    if viz == 'signal':
+                        save_dir = os.path.join(
+                            self.savedir, f'{name}_signal/{str(self.current_iteration//1000).zfill(4)}_{str(idx).zfill(5)}.png')
+                        plot_and_save_figure(pred_sig[0, :], ori_sig[0, :], pred_time[0, :], ori_time[0, :],
+                                             position_rx[0, :], position_tx[0, :], mode_set=name, save_path=save_dir)
+                    elif viz == 'map':
+                        save_dir = os.path.join(
+                            self.savedir, f'{name}_map/{str(self.current_iteration//1000).zfill(4)}_{str(idx).zfill(5)}.png')
+                        log_inference_figure(ori_time.detach().cpu().numpy()[0, :], pred_time.detach(
+                        ).cpu().numpy()[0, :], metrics=metrics, save_dir=save_dir)
+                # Visualize only prediction
+                else:
+                    if viz == 'signal':
+                        save_dir = os.path.join(
+                            self.savedir, f'{name}_signal/{str(self.current_iteration//1000).zfill(4)}_{str(idx).zfill(5)}.png')
+                        plot_and_save_figure(pred_sig[0, :], ori_sig[0, :], pred_time[0, :], ori_time[0, :],
+                                             position_rx[0, :], position_tx[0, :], mode_set=name, save_path=save_dir)
+                    elif viz == 'map':
+                        save_dir = os.path.join(
+                            self.savedir, f'{name}_map/{str(self.current_iteration//1000).zfill(4)}_{str(idx).zfill(5)}.png')
+                        log_inference_figure(ori_time.detach().cpu().numpy()[0, :], pred_time.detach(
+                        ).cpu().numpy()[0, :], metrics=metrics, save_dir=save_dir)
+
+        # Log the metrics
+        if ori_sig[0] is not None:
+            num_batches = len(dataloader)
+            avg_losses = {
+                key: val / num_batches for key, val in avg_losses.items()}
+            avg_metrics = {
+                key: val / num_batches for key, val in avg_metrics.items()}
+
+            self.logger.info('Angle:{:.3f}, Amplitude:{:.4f}, Envelope:{:.4f}, T60:{:.5f}, C50:{:.5f}, EDT:{:.5f}, multi_stft:{:.4f}'.format(
+                avg_metrics['Angle'], avg_metrics['Amplitude'], avg_metrics['Envelope'], avg_metrics['T60'], avg_metrics['C50'], avg_metrics['EDT'], avg_metrics['multi_stft']))
+
+            if self.log:
+                self.log_all(
+                    losses=avg_losses, metrics=avg_metrics, cur_iter=self.current_iteration, mode_set=name)
 
     def calculate_metrics(self, pred_sig, ori_sig, fs, return_metrics=False):
         """ calculate the metrics and losses
@@ -469,6 +480,14 @@ class AVR_Runner():
                 {f'{mode_set}_metric/{metric_name}': value}, step=cur_iter)
 
 
+def string_to_float_list(string):
+    if string is None:
+        return None
+    if string.startswith('[') and string.endswith(']'):
+        string = string[1:-1]
+    return [float(x) for x in string.split(',')]
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--log', type=str, default='on')
@@ -484,12 +503,8 @@ if __name__ == '__main__':
     parser.add_argument('--viz', type=str)
     args = parser.parse_args()
 
-    if args.mode == 'train':  # specify the config yaml
-        with open(args.config, 'r') as file:
-            kwargs = yaml.load(file, Loader=yaml.FullLoader)
-    elif args.mode == 'test':  # specify the dict of the config yaml
-        with open(os.path.join(args.config, 'avr_conf.yml'), 'r') as file:
-            kwargs = yaml.load(file, Loader=yaml.FullLoader)
+    with open(args.config, 'r') as file:
+        kwargs = yaml.load(file, Loader=yaml.FullLoader)
 
     # backup config file
     logdir = kwargs['path']['logdir']
@@ -527,4 +542,8 @@ if __name__ == '__main__':
     worker = AVR_Runner(
         mode=args.mode, dataset_dir=args.dataset_dir, ckpt=args.ckpt, log=args.log, **kwargs)
 
-    worker.train()
+    if args.mode == 'train':
+        worker.train()
+    elif args.mode == 'infer':
+        worker.infer(idxs=args.idx, position_rxs=args.pos_rx,
+                     position_txs=args.pos_tx, direction_txs=args.dir_tx, viz=args.viz)
