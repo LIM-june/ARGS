@@ -24,7 +24,7 @@ from utils.criterion import Criterion
 
 
 class AVR_Runner():
-    def __init__(self, mode, dataset_dir, batchsize, log, **kwargs) -> None:
+    def __init__(self, mode, dataset_dir, ckpt, log, **kwargs) -> None:
         # Seperate each settings
         kwargs_path = kwargs['path']
         kwargs_render = kwargs['render']
@@ -34,51 +34,59 @@ class AVR_Runner():
 
         # Path settings
         self.expname = kwargs_path['expname']
-        self.dataset_type = kwargs_path['dataset_type']
+        self.dataset = kwargs_path['dataset']
         self.logdir = kwargs_path['logdir']
-        self.devices = torch.device('cuda')
+        self.time = datetime.now().strftime("%m%d-%H%M%S")
+        self.runname = os.path.join(self.dataset, self.expname, self.time)
+        self.savedir = os.path.join(self.logdir, self.runname)
 
         # Logger
-        self.log = True if log.lower() == 'on' else False
-        log_filename = "logger.log"
-        log_savepath = os.path.join(
-            self.logdir, self.expname, log_filename)
         self.logger = logger_config(
-            log_savepath=log_savepath, logging_name=self.expname)
-        self.logger.info("expname:%s, data type:%s, logdir:%s",
-                         self.expname, self.dataset_type, self.logdir)
+            log_savepath=os.path.join(self.logdir, "logger.log"),
+            logging_name=self.runname
+        )
+        self.logger.info(
+            "\n⭐️ LOGDIR:%s, DATASET:%s, EXPNAME:%s, TIME:%s ⭐️",
+            self.logdir, self.dataset, self.expname, self.time)
 
         # tensorboard writer
-        if self.log:
-            if mode == 'train':
-                log_prefix = f'tensorboard_logs/{(self.logdir).split("/")[1]}/{self.expname}'
-                time = datetime.now().strftime("%m%d-%H%M%S")
-                os.makedirs(log_prefix, exist_ok=True)
-                self.writer = SummaryWriter(log_dir=f'{log_prefix}/{time}')
+        self.log = True if log.lower() == 'on' else False
+        if self.log and mode == 'train':
+            tensorboard_dir = os.path.join(
+                'tensorboard_logs', self.runname)
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = SummaryWriter(tensorboard_dir)
 
         # wandb logger
-                self.wandb = wandb.init(
-                    name=f'{self.expname}/{time}',
-                    # Set the wandb entity where your project will be logged (generally your team name).
-                    entity="LIM-june",
-                    # Set the wandb project where this run will be logged.
-                    project=f"ARGS_{self.logdir.split('/')[1]}",
-                    # Track hyperparameters and run metadata.
-                    config=kwargs,
-                )
+            self.wandb = wandb.init(
+                name=self.runname,
+                # Set the wandb entity where your project will be logged (generally your team name).
+                entity="LIM-june",
+                # Set the wandb project where this run will be logged.
+                project=f"ARGS",
+                # Track hyperparameters and run metadata.
+                config=kwargs,
+            )
+
+        # Image save path
+            os.makedirs(os.path.join(self.savedir, 'img_train'), exist_ok=True)
+            os.makedirs(os.path.join(self.savedir, 'img_test'), exist_ok=True)
+            os.makedirs(os.path.join(
+                self.savedir, 'img_test_energy'), exist_ok=True)
 
         # network and renderer
         self.fs = kwargs['render']['fs']
 
-        if self.dataset_type == 'MeshRIR' or self.dataset_type == 'Simu':
+        if self.dataset == 'MeshRIR' or self.dataset == 'Simu':
             audionerf = AVRModel(kwargs_network)  # network
-        elif self.dataset_type == 'RAF':
+        elif self.dataset == 'RAF':
             audionerf = AVRModel_complex(kwargs_network)  # network
 
         self.renderer = AVRRender(
             networks_fn=audionerf, **kwargs_render)  # renderer
 
         # multi gpu
+        self.devices = torch.device('cuda')
         if torch.cuda.device_count() > 1:
             self.renderer = nn.DataParallel(self.renderer)
         self.renderer = self.renderer.cuda()
@@ -100,19 +108,18 @@ class AVR_Runner():
 
         # Train Settings
         self.current_iteration = 1
-        if kwargs_train['load_ckpt']:
-            self.load_checkpoints()
-        self.batch_size = batchsize
+        self.load_checkpoints(ckpt)
+        self.batch_size = kwargs_train['batch_size']
         self.total_iterations = kwargs_train['total_iterations']
         self.save_freq = kwargs_train['save_freq']
         self.val_freq = kwargs_train['val_freq']
 
         # dataloader
-        self.train_set = WaveLoader(base_folder=dataset_dir, dataset_type=self.dataset_type,
+        self.train_set = WaveLoader(base_folder=dataset_dir, dataset_type=self.dataset,
                                     eval=False, seq_len=kwargs_network['signal_output_dim'], fs=kwargs_render['fs'])
-        self.test_set = WaveLoader(base_folder=dataset_dir, dataset_type=self.dataset_type,
+        self.test_set = WaveLoader(base_folder=dataset_dir, dataset_type=self.dataset,
                                    eval=True, seq_len=kwargs_network['signal_output_dim'], fs=kwargs_render['fs'])
-        self.train_set_show = WaveLoader(base_folder=dataset_dir, dataset_type=self.dataset_type,
+        self.train_set_show = WaveLoader(base_folder=dataset_dir, dataset_type=self.dataset,
                                          eval=False, seq_len=kwargs_network['signal_output_dim'], fs=kwargs_render['fs'])
 
         self.train_iter = DataLoader(
@@ -128,38 +135,78 @@ class AVR_Runner():
         # loss settings
         self.criterion = Criterion(kwargs_train)
 
-    def load_checkpoints(self):
+    def load_checkpoints(self, ckpt):
         """load previous checkpoints
         """
-        ckptsdir = os.path.join(self.logdir, self.expname, 'ckpts')
-        if not os.path.exists(ckptsdir):
-            os.makedirs(ckptsdir)
-        ckpts = [os.path.join(ckptsdir, f)
-                 for f in sorted(os.listdir(ckptsdir)) if 'tar' in f]
-        self.logger.info('Found ckpts %s', ckpts)
 
-        if len(ckpts) > 0:
+        # Skip loading
+        if ckpt is None:
+            self.logger.info('No checkpoint given. Train from scratch')
+            return
+
+        # Load from checkpoint path
+        if os.path.exists(ckpt) and ckpt.endswith('.tar'):
+            ckpt_path = ckpt
+        elif os.path.exists(ckpt+'.tar'):
+            ckpt_path = ckpt+'.tar'
+
+        # Load the latest checkpoint
+        else:
+            # Default
+            dir = os.path.join(self.logdir, self.dataset, self.expname)
+            target = '.tar'
+
+            # Specify model name
+            if os.path.exists(os.path.join(self.logdir, self.dataset, ckpt)):
+                dir = os.path.join(self.logdir, self.dataset, ckpt)
+            # Specify runname
+            elif os.path.exists(os.path.join(dir, ckpt)):
+                dir = os.path.join(dir, ckpt)
+            # Specify iteration number
+            elif ckpt.isdigit() or ckpt.endswith('.tar'):
+                target = f'{int(ckpt.split(".")[0]):06d}.tar'
+            # Specify latest
+            elif ckpt != '-1':
+                self.logger.info('No checkpoint directory found, so skipping')
+                return
+
+            # Recursive search for ckpt
+            ckpts = []
+            for dir, _, files in os.walk(dir):
+                for file in files:
+                    if file.endswith(target):
+                        ckpts.append(os.path.join(dir, file))
+
+            if len(ckpts) == 0:
+                self.logger.info('No checkpoints found, so skipping')
+                return
+
+            self.logger.info('Found ckpts:')
+            ckpts = sorted(ckpts)
+            for ckpt in ckpts:
+                self.logger.info(ckpt)
             ckpt_path = ckpts[-1]
-            self.logger.info('Loading ckpt %s', ckpt_path)
-            ckpt = torch.load(ckpt_path, map_location=self.devices)
 
-            try:
-                self.renderer.load_state_dict(
-                    ckpt['audionerf_network_state_dict'])
-            except:
-                self.renderer.module.load_state_dict(
-                    ckpt["audionerf_network_state_dict"])
+        self.logger.info('Loading ckpt %s', ckpt_path)
+        ckpt = torch.load(ckpt_path, map_location=self.devices)
 
-            self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.renderer.parameters()), lr=float(self.kwargs_train['lr']),
-                                              weight_decay=float(
-                                                  self.kwargs_train['weight_decay']),
-                                              betas=(0.9, 0.999))
-            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+        try:
+            self.renderer.load_state_dict(
+                ckpt['audionerf_network_state_dict'])
+        except:
+            self.renderer.module.load_state_dict(
+                ckpt["audionerf_network_state_dict"])
 
-            self.cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=self.optimizer, T_max=float(
-                self.kwargs_train['T_max']), eta_min=float(self.kwargs_train['eta_min']))
-            self.cosine_scheduler.load_state_dict(ckpt['scheduler_state_dict'])
-            self.current_iteration = ckpt['current_iteration']
+        self.optimizer = torch.optim.Adam(filter(lambda p: p.requires_grad, self.renderer.parameters()), lr=float(self.kwargs_train['lr']),
+                                          weight_decay=float(
+            self.kwargs_train['weight_decay']),
+            betas=(0.9, 0.999))
+        self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+
+        self.cosine_scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer=self.optimizer, T_max=float(
+            self.kwargs_train['T_max']), eta_min=float(self.kwargs_train['eta_min']))
+        self.cosine_scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        self.current_iteration = ckpt['current_iteration']
 
     def save_checkpoint(self):
         """save model checkpoint
@@ -168,11 +215,9 @@ class AVR_Runner():
         -------
         checkpoint name
         """
-        ckptsdir = os.path.join(self.logdir, self.expname, 'ckpts')
+        ckptsdir = os.path.join(self.savedir, 'ckpts')
         if not os.path.exists(ckptsdir):
             os.makedirs(ckptsdir)
-        model_lst = [x for x in sorted(
-            os.listdir(ckptsdir)) if x.endswith('.tar')]
 
         ckptname = os.path.join(
             ckptsdir, '{:06d}.tar'.format(self.current_iteration))
@@ -199,7 +244,7 @@ class AVR_Runner():
         while self.current_iteration <= self.total_iterations:
             with tqdm(total=len(self.train_iter), desc=f"Iteration {self.current_iteration}/{self.total_iterations}") as pbar:
                 for train_batch in self.train_iter:
-                    if self.dataset_type == "RAF":
+                    if self.dataset == "RAF":
                         ori_sig, position_rx, position_tx, direction_tx = train_batch
                         pred_sig = self.renderer(
                             position_rx.cuda(), position_tx.cuda(), direction_tx.cuda())
@@ -267,7 +312,7 @@ class AVR_Runner():
 
                         for check_idx, test_batch in enumerate(self.test_iter):
                             with torch.no_grad():
-                                if self.dataset_type == "RAF":
+                                if self.dataset == "RAF":
                                     ori_sig, position_rx, position_tx, direction_tx = test_batch
                                     pred_sig = self.renderer(
                                         position_rx.cuda(), position_tx.cuda(), direction_tx.cuda())
@@ -289,14 +334,14 @@ class AVR_Runner():
                             for key in metrics:
                                 avg_metrics[key] += metrics[key]
 
-                            if check_idx < 15:
+                            if check_idx < self.kwargs_train['n_imgs']:
                                 save_dir = os.path.join(
-                                    self.logdir, self.expname, f'img_test/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
+                                    self.savedir, f'img_test/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
                                 plot_and_save_figure(pred_sig[0, :], ori_sig[0, :], pred_time[0, :], ori_time[0, :],
                                                      position_rx[0, :], position_tx[0, :], mode_set='test', save_path=save_dir)
 
                                 save_dir = os.path.join(
-                                    self.logdir, self.expname, f'img_test/energy_{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
+                                    self.savedir, f'img_test_energy/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
                                 log_inference_figure(ori_time.detach().cpu().numpy()[0, :], pred_time.detach(
                                 ).cpu().numpy()[0, :], metrics=metrics, save_dir=save_dir)
 
@@ -320,7 +365,7 @@ class AVR_Runner():
 
                         for check_idx, train_iter_batch in enumerate(self.train_iter_show):
                             with torch.no_grad():
-                                if self.dataset_type == "RAF":
+                                if self.dataset == "RAF":
                                     ori_sig, position_rx, position_tx, direction_tx = train_iter_batch
                                     pred_sig = self.renderer(
                                         position_rx.cuda(), position_tx.cuda(), direction_tx.cuda())
@@ -342,9 +387,9 @@ class AVR_Runner():
                             for key in metrics:
                                 avg_metrics[key] += metrics[key]
 
-                            if check_idx < 15:
+                            if check_idx < self.kwargs_train['n_imgs']:
                                 save_dir = os.path.join(
-                                    self.logdir, self.expname, f'img_train/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
+                                    self.savedir, f'img_train/{str(self.current_iteration//1000).zfill(4)}_{str(check_idx).zfill(5)}.png')
                                 plot_and_save_figure(pred_sig[0, :], ori_sig[0, :], pred_time[0, :], ori_time[0, :],
                                                      position_rx[0, :], position_tx[0, :], mode_set='train', save_path=save_dir)
 
@@ -431,7 +476,12 @@ if __name__ == '__main__':
     parser.add_argument('--config', type=str,
                         default='avr.yml', help='config file path')
     parser.add_argument('--dataset_dir', type=str, default='S1-M3969_npy')
-    parser.add_argument('--batch_size', type=int, default=6)
+    parser.add_argument('--ckpt', type=str)
+    parser.add_argument('--idx', type=string_to_float_list)
+    parser.add_argument('--pos-rx', type=string_to_float_list)
+    parser.add_argument('--pos-tx', type=string_to_float_list)
+    parser.add_argument('--dir-tx', type=string_to_float_list)
+    parser.add_argument('--viz', type=str)
     args = parser.parse_args()
 
     if args.mode == 'train':  # specify the config yaml
@@ -442,7 +492,7 @@ if __name__ == '__main__':
             kwargs = yaml.load(file, Loader=yaml.FullLoader)
 
     # backup config file
-    logdir = os.path.join(kwargs['path']['logdir'], kwargs['path']['expname'])
+    logdir = kwargs['path']['logdir']
     os.makedirs(logdir, exist_ok=True)
 
     # Log the command to the file
@@ -455,19 +505,26 @@ if __name__ == '__main__':
     # Construct the destination file path
     dest_file_path = os.path.join(logdir, 'avr_conf.yml')
 
-    # create the img path
-    img_train_dir = os.path.join(logdir, 'img_train')
-    os.makedirs(img_train_dir, exist_ok=True)
-
-    img_test_dir = os.path.join(logdir, 'img_test')
-    os.makedirs(img_test_dir, exist_ok=True)
-
     # Check if the source and destination paths are the same
     if os.path.abspath(args.config) != os.path.abspath(dest_file_path):
         copyfile(args.config, dest_file_path)
     else:
         print("Source and destination are the same, skipping copy.")
 
-    worker = AVR_Runner(mode=args.mode, dataset_dir=args.dataset_dir,
-                        batchsize=args.batch_size, log=args.log, **kwargs)
+    print()
+    if args.mode == 'train':
+        print("Training mode selected.")
+    elif args.mode == 'infer':
+        print("Inference mode selected.")
+        if args.ckpt is None:
+            args.ckpt = '-1'
+            print("Please specify a checkpoint to load for inference.")
+            print("Defaulting to the latest checkpoint.")
+    else:
+        print("Invalid mode. Please choose 'train' or 'infer'.")
+        sys.exit(1)
+
+    worker = AVR_Runner(
+        mode=args.mode, dataset_dir=args.dataset_dir, ckpt=args.ckpt, log=args.log, **kwargs)
+
     worker.train()
